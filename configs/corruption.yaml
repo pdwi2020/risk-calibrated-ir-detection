@@ -1,0 +1,23 @@
+corruption_types:
+  gaussian_noise:
+    severities: [10, 20, 40, 60]
+  poisson_noise:
+    severities: [1, 2, 3, 4]
+    mode: intensity_dependent
+  motion_blur:
+    kernel_sizes: [3, 5, 9, 13]
+  defocus_blur:
+    sigma_values: [1, 2, 4, 8]
+  low_contrast:
+    scale_factors: [0.9, 0.75, 0.5, 0.25]
+  fog_koschmieder:
+    beta_values: [0.1, 0.3, 0.6, 1.0]
+    attenuation_model: exponential
+
+severity_levels: [1, 2, 3, 4]
+batch_size: 16
+save_corrupted_images: false
+compute_mce: true
+reference_model: yolov8m
+
+output_dir: /workspace/results/corruption

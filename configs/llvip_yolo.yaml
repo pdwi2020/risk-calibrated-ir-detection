@@ -1,0 +1,14 @@
+# LLVIP — YOLOv8 training config (IR / lwir modality)
+# Images: LLVIP-YOLO/{split}/lwir/images/
+# Labels: LLVIP-YOLO/{split}/lwir/labels/  ← symlinked from visible/labels/
+#
+# Create symlinks first:  python ~/scripts/llvip_make_lwir_labels.py
+# (or run: bash -c 'cd .../LLVIP-YOLO/train/lwir && ln -s ../visible/labels labels')
+
+path: /Volumes/Crucial X9/Research Projects/MV_Paper/datasets/llvip/LLVIP-YOLO
+train: train/lwir/images
+val: test/lwir/images
+
+nc: 1
+names:
+  0: person

@@ -1,0 +1,11 @@
+cost_fn: 10.0
+cost_fp: 1.0
+cost_loc: 2.0
+cost_defer: 0.5
+iou_threshold: 0.5
+confidence_threshold_sweep: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+mc_dropout_samples: 20
+tta_augmentations: [hflip, scale_0.9, scale_1.1]
+corruption_types: [gaussian, poisson, motion_blur, defocus_blur, low_contrast, fog]
+corruption_severities: [1, 2, 3, 4]
+ece_n_bins: 10

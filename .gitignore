@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverrideS
+
+# Model checkpoints / weights
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# PDF / paper artifacts
+*.pdf
+
+# Data directories
+data/
+datasets/
+
+# Output / experiment directories
+results/
+runs/
+wandb/
+audit_output/
+vast_runs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

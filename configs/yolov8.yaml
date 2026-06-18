@@ -1,0 +1,12 @@
+model: yolov8m.pt
+imgsz: 640
+batch: 16
+epochs: 100
+patience: 20
+device: 0
+workers: 8
+optimizer: AdamW
+lr0: 0.001
+weight_decay: 0.0005
+save_period: 10
+project: /workspace/checkpoints/yolov8

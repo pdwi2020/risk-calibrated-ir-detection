@@ -1,0 +1,16 @@
+# FLIR ADAS v2 — YOLOv8 training config
+# Images: /Volumes/PDWI/MV_Paper_data/flir_yolo/{train,val}/images/  (symlinks to X9)
+# Labels: /Volumes/PDWI/MV_Paper_data/flir_yolo/{train,val}/labels/  (YOLO txt, from COCO→YOLO converter)
+#
+# Generate labels first:  python ~/scripts/flir_coco_to_yolo.py
+# Eval split: CALIBRATION (572 images from val, used for temperature scaling / conformal CP)
+
+path: /Volumes/PDWI/MV_Paper_data/flir_yolo
+train: train/images
+val: val_calib/images
+
+nc: 3
+names:
+  0: person
+  1: bike
+  2: car
