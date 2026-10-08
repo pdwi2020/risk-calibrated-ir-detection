@@ -103,7 +103,7 @@ def run_grid(repo: Path) -> Tuple[List[Dict], Dict[str, float]]:
             cost_test = cs.compute_cost(test_preds, test_gt, theta_star) / n
             cost_05   = cs.compute_cost(test_preds, test_gt, 0.5) / n
             cost_red  = (cost_05 - cost_test) / max(cost_05, 1e-6) * 100.0
-            raap = cs.risk_adjusted_ap(map50, cost_test)
+            raap = cs.risk_adjusted_ap(map50, cost_test, cs.mean_gt_per_image(test_gt))
             results.append({
                 "model":   det_name,
                 "c_fn":    c_fn,

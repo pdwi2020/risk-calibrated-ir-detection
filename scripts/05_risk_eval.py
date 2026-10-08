@@ -8,8 +8,9 @@ the three contribution modules:
   * cost-sensitive thresholding  -> theta* = argmin E[C(theta)], and the E[C]
     reduction at theta* vs the naive theta=0.5 (the core >=15% claim);
   * temperature scaling          -> detection ECE before/after (gate: < 0.05);
-  * conformal risk control       -> lambda_hat + empirical test coverage vs 1-alpha;
-  * RA-AP = mAP - alpha_ra * E[C(theta*)]  (the novel metric).
+  * conformal risk control       -> lambda_hat + empirical test coverage vs 1-alpha
+    (lambda_hat is None when no threshold certifies alpha: the infeasible case);
+  * RA-AP = mAP - E[C(theta*)] / (c_FN * mean GT per image)  (the novel metric).
 
 LEAKAGE-FREE (paper) MODE  --calib-json X --test-json Y :
   T, theta* and lambda_hat are FIT ON CALIBRATION; every headline number is
@@ -140,7 +141,6 @@ def analyze(
     c_def: float,
     iou: float,
     alpha_conf: float,
-    alpha_ra: float,
     map_test: Optional[float],
     theta_sweep: Sequence[float],
     lambda_grid: Sequence[float],
@@ -182,11 +182,11 @@ def analyze(
     lam = crc.calibrate(cal_pred, cal_gt, list(lambda_grid))
     cov = crc.validate_coverage(test_pred, test_gt)
 
-    # --- RA-AP on test: normalize E[C] to PER-IMAGE so RA-AP stays on a
-    #     mAP-comparable scale (the absolute summed cost would otherwise swamp mAP) ---
+    # --- RA-AP on test: per-image E[C] over the per-image detect-nothing cost ---
     n_test = max(len(test), 1)
     e_cost_per_img = c_test_star / n_test
-    ra_ap = (cost.risk_adjusted_ap(map_test, e_cost_per_img, alpha=alpha_ra)
+    mean_gt = cost.mean_gt_per_image(test_gt)
+    ra_ap = (cost.risk_adjusted_ap(map_test, e_cost_per_img, mean_gt)
              if map_test is not None else None)
 
     return {
@@ -212,7 +212,7 @@ def analyze(
         "test_coverage": cov["test_coverage"],
         "conformal_controlled": cov["controlled"],
         "map_test": map_test,
-        "alpha_ra": alpha_ra,
+        "mean_gt_per_image": mean_gt,
         "ra_ap": ra_ap,
     }
 
@@ -250,14 +250,16 @@ def report(res: Dict, leakage_free: bool) -> None:
 
     print("[conformal]")
     print(f"  alpha                  = {res['conformal_alpha']:.2f}")
-    print(f"  lambda_hat             = {res['lambda_hat']:.2f}   (calib)")
+    lam = res["lambda_hat"]
+    print(f"  lambda_hat             = {_fmt(lam, 3)}   (calib)"
+          + ("   [infeasible: no threshold certifies alpha]" if lam is None else ""))
     print(f"  test miss-rate         = {_fmt(res['test_miss_rate'])}   "
           f"coverage = {_fmt(res['test_coverage'])}   "
           f"controlled = {res['conformal_controlled']}")
 
     print("[RA-AP]")
     print(f"  mAP                    = {_fmt(res['map_test'])}")
-    print(f"  RA-AP = mAP - {res['alpha_ra']}*E[C*] = {_fmt(res['ra_ap'])}\n")
+    print(f"  RA-AP = mAP - E[C*]/(c_FN*g), g={_fmt(res['mean_gt_per_image'], 2)} = {_fmt(res['ra_ap'])}\n")
 
 
 # ----------------------------------------------------------------------------
@@ -276,7 +278,6 @@ def main() -> None:
     ap.add_argument("--iou", type=float, default=0.5)
     ap.add_argument("--alpha-conf", type=float, default=0.1,
                     help="conformal target miss-rate budget")
-    ap.add_argument("--alpha-ra", type=float, default=0.01, help="RA-AP risk weight")
     ap.add_argument("--ece-min-conf", type=float, default=0.05,
                     help="min detection conf for ECE/temperature (drop the conf~0 tail)")
     ap.add_argument("--out", default=None, help="write JSON summary here")
@@ -308,7 +309,7 @@ def main() -> None:
     res = analyze(
         calib, test,
         c_fn=args.c_fn, c_fp=args.c_fp, c_loc=args.c_loc, c_def=args.c_def,
-        iou=args.iou, alpha_conf=args.alpha_conf, alpha_ra=args.alpha_ra,
+        iou=args.iou, alpha_conf=args.alpha_conf,
         map_test=map_test, theta_sweep=theta_sweep, lambda_grid=lambda_grid,
         ece_min_conf=args.ece_min_conf,
     )
