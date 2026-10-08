@@ -1,0 +1,23 @@
+name: Lean proofs
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal
+      - name: Check axioms (no sorryAx)
+        working-directory: formal
+        shell: bash  # explicit shell enables pipefail, so a failing Audit.lean fails the step
+        run: |
+          lake env lean Audit.lean | tee audit.txt
+          ! grep -q sorryAx audit.txt
+          test "$(grep -c -E 'depends on axioms|does not depend on any axioms' audit.txt)" -eq "$(grep -c '^#print axioms' Audit.lean)"
