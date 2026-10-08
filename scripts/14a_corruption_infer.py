@@ -48,31 +48,39 @@ try:
 except ImportError:
     _CV2 = False
 
-from src.corruption.corruption_pipeline import CORRUPTION_REGISTRY
+from src.corruption.corruption_pipeline import CORRUPTION_REGISTRY, image_snr_db
 
 # ---------------------------------------------------------------------------
 # Detector configs (weights relative to project root; adjusted for /workspace)
 # ---------------------------------------------------------------------------
+# weights_rel paths match the actual X9 checkpoint names; the pod must receive
+# results/<det>/... at the same relative path (rsync preserves it). Fallbacks
+# cover the on-pod training layout (weights/best.pt) from the original run.
 DETECTOR_CONFIGS = {
     "yolov8m": {
         "type": "ultralytics",
-        "weights_rel": "results/yolov8m_flir_seed0/weights/best.pt",
+        "weights_rel": "results/yolov8m_flir_seed0/yolov8m_flir_final.pt",
+        "weights_fallbacks": ["results/yolov8m_flir_seed0/weights/best.pt"],
     },
     "yolov11m": {
         "type": "ultralytics",
         "weights_rel": "results/yolov11m_flir_seed0/weights/best.pt",
+        "weights_fallbacks": ["results/yolov11m_flir_seed0/yolov11m_flir_final.pt"],
     },
     "rtdetr": {
         "type": "ultralytics_rtdetr",
-        "weights_rel": "results/rtdetr_flir_seed0/rtdetr_flir/weights/best.pt",
+        "weights_rel": "results/rtdetr_flir_seed0/rtdetr_flir_final.pt",
+        "weights_fallbacks": ["results/rtdetr_flir_seed0/rtdetr_flir/weights/best.pt"],
     },
     "faster_rcnn": {
         "type": "frcnn",
         "weights_rel": "results/faster_rcnn_flir_seed0/weights/frcnn_best.pth",
+        "weights_fallbacks": ["results/faster_rcnn_flir_seed0/frcnn_best.pth"],
     },
     "retinanet": {
         "type": "retinanet",
         "weights_rel": "results/retinanet_flir_seed0/retinanet_best.pth",
+        "weights_fallbacks": [],
     },
 }
 
@@ -106,21 +114,26 @@ def _gray_to_3ch(img: np.ndarray) -> np.ndarray:
 # FLIR test split loader
 # ---------------------------------------------------------------------------
 
-def load_flir_test(flir_root: Path, split_json: Path) -> Tuple[List[str], List[Dict]]:
-    """Return (image_paths, gt_records) for the FLIR test split."""
+def load_flir_split(flir_root: Path, split_json: Path,
+                    which: str = "test") -> Tuple[List[str], List[Dict], List[int]]:
+    """Return (image_paths, gt_records, image_ids) for the FLIR ``which`` split.
+
+    ``which`` in {'calibration', 'test'}; only GT-bearing images of the kept
+    classes are returned (background-only frames carry no detection signal).
+    """
     split = json.loads(split_json.read_text())
-    test_ids = set(split["test"])
+    sel_ids = set(split[which])
     coco_ann = flir_root / "images_thermal_val/coco.json"
     gt_data = json.loads(coco_ann.read_text())
     id2file = {img["id"]: img["file_name"] for img in gt_data["images"]}
     ann_map: Dict[int, list] = defaultdict(list)
     for ann in gt_data["annotations"]:
-        if ann["image_id"] in test_ids and ann["category_id"] in VALID_CATS:
+        if ann["image_id"] in sel_ids and ann["category_id"] in VALID_CATS:
             ann_map[ann["image_id"]].append(ann)
 
     base = flir_root / "images_thermal_val"
     image_paths, gt_records, image_ids = [], [], []
-    for img_id in sorted(test_ids):
+    for img_id in sorted(sel_ids):
         if img_id not in id2file:
             continue
         anns = ann_map[img_id]
@@ -199,6 +212,15 @@ def load_llvip_test(llvip_root: Path, split_json: Path) -> Tuple[List[str], List
 def build_predict_fn(det_name: str, repo: Path):
     cfg = DETECTOR_CONFIGS[det_name]
     weights = repo / cfg["weights_rel"]
+    if not weights.exists():
+        for fb in cfg.get("weights_fallbacks", []):
+            if (repo / fb).exists():
+                weights = repo / fb
+                break
+    if not weights.exists():
+        sys.exit(f"ERROR: {det_name} weights not found at {cfg['weights_rel']} "
+                 f"or fallbacks {cfg.get('weights_fallbacks', [])}")
+    print(f"  [{det_name}] weights: {weights}")
     dtype = cfg["type"]
 
     if dtype in ("ultralytics", "ultralytics_rtdetr"):
@@ -296,15 +318,33 @@ def run_condition(
     image_ids,
     corruption_fn=None,  # None = clean
     severity: int = 0,
+    base_seed: Optional[int] = None,   # enables reproducible seeded corruption
+    corr_idx: int = 0,                 # stable per-corruption-type index
 ) -> Tuple[List[Dict], float]:
-    """Return (per_image_records, mAP50)."""
+    """Return (per_image_records, mAP50).
+
+    When ``base_seed`` is set, each image gets an independent but reproducible
+    noise realisation seeded by (base_seed, corr_idx, severity, image position).
+    The seed is INDEPENDENT of the detector, so every model sees pixel-identical
+    corrupted inputs -- essential for fair cross-detector comparison and for the
+    corruption-conditioned CACH head.
+    """
     records = []
     preds_for_map = []
+    snr_vals: List[float] = []
 
-    for img_path, gt, img_id in zip(image_paths, gt_records, image_ids):
-        img = _load_gray(img_path)
+    for i, (img_path, gt, img_id) in enumerate(zip(image_paths, gt_records, image_ids)):
+        clean = _load_gray(img_path)
+        img = clean
         if corruption_fn is not None:
-            img = corruption_fn(img, severity)
+            if base_seed is not None:
+                ss = np.random.SeedSequence([base_seed, corr_idx, severity, i])
+                img = corruption_fn(clean, severity, np.random.default_rng(ss))
+            else:
+                img = corruption_fn(clean, severity)
+            snr = image_snr_db(clean, img)
+            if np.isfinite(snr):
+                snr_vals.append(snr)
         result = predict_fn([img])[0]
         records.append({
             "image_id": img_id,
@@ -317,7 +357,8 @@ def run_condition(
         preds_for_map.append(result)
 
     map50 = compute_map50(gt_records, preds_for_map)
-    return records, map50
+    mean_snr = float(np.mean(snr_vals)) if snr_vals else None
+    return records, map50, mean_snr
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +380,12 @@ def main():
                     default=list(CORRUPTION_REGISTRY.keys()),
                     choices=list(CORRUPTION_REGISTRY.keys()))
     ap.add_argument("--severities", nargs="+", type=int, default=[1, 2, 3, 4])
+    ap.add_argument("--split", choices=["calibration", "test", "both"],
+                    default="both",
+                    help="FLIR split(s) to regenerate corrupted caches for. "
+                         "P3 needs BOTH so calibration can fit and test can report.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Base seed for reproducible corruption (model-independent).")
     ap.add_argument("--skip-llvip", action="store_true",
                     help="Skip LLVIP inference (e.g. data not present).")
     ap.add_argument("--dry-run", action="store_true",
@@ -376,79 +423,83 @@ def main():
 
     out_dir = REPO / "results/corruption_preds"
     out_dir.mkdir(parents=True, exist_ok=True)
+    corr_idx = {n: i for i, n in enumerate(CORRUPTION_REGISTRY)}
+    splits = ["calibration", "test"] if args.split == "both" else [args.split]
 
-    n_conditions = len(args.models) * (1 + len(args.corruptions) * len(args.severities))
-    print(f"\nPlan: {len(args.models)} models × (1 clean + "
+    n_conditions = (len(splits) * len(args.models)
+                    * (1 + len(args.corruptions) * len(args.severities)))
+    print(f"\nPlan: splits={splits}  {len(args.models)} models × (1 clean + "
           f"{len(args.corruptions)} corruptions × {len(args.severities)} severities) "
-          f"= {n_conditions} conditions")
+          f"= {n_conditions} conditions  (seed={args.seed})")
     print(f"Output dir: {out_dir}")
     if args.dry_run:
         print("--dry-run: exiting.")
         return
 
-    # ── load FLIR test split ───────────────────────────────────────────────────
-    print("\nLoading FLIR test split ...")
-    image_paths, gt_records, image_ids = load_flir_test(flir_root, Path(args.split_json))
-    print(f"  {len(image_paths)} test images")
-
-    # mCE tracking
-    clean_map: Dict[str, float] = {}
+    # mCE / SNR tracking across all (split, model)
     all_mce_rows = []
+    snr_rows = []  # SNR is model-independent; recorded once per (split,corr,sev)
 
-    # ── per-model loop ─────────────────────────────────────────────────────────
-    for model_name in args.models:
-        print(f"\n{'='*60}\n  Model: {model_name}\n{'='*60}")
-        predict_fn = build_predict_fn(model_name, REPO)
+    for which in splits:
+        print(f"\n########## FLIR split: {which} ##########")
+        image_paths, gt_records, image_ids = load_flir_split(
+            flir_root, Path(args.split_json), which)
+        print(f"  {len(image_paths)} {which} images (GT-bearing)")
 
-        # Clean baseline
-        print("  [clean] ...")
-        clean_records, clean_m = run_condition(predict_fn, image_paths, gt_records, image_ids)
-        clean_map[model_name] = clean_m
-        out_path = out_dir / f"{model_name}_clean.json"
-        out_path.write_text(json.dumps(clean_records))
-        print(f"    mAP@0.5 = {clean_m:.4f}  → {out_path.name}")
+        for model_name in args.models:
+            print(f"\n{'='*60}\n  [{which}] Model: {model_name}\n{'='*60}")
+            predict_fn = build_predict_fn(model_name, REPO)
 
-        # Corrupted conditions
-        sev_errors: Dict[str, List[float]] = defaultdict(list)
-        for cname in args.corruptions:
-            cfn = CORRUPTION_REGISTRY[cname]
-            for sev in args.severities:
-                out_path = out_dir / f"{model_name}_{cname}_{sev}.json"
-                if out_path.exists():
-                    print(f"  [{cname} sev={sev}] already cached — skipping.")
-                    existing = json.loads(out_path.read_text())
-                    # Recompute mAP from cache for mCE
-                    p4m = [{"boxes": r["pred_boxes"], "scores": r["pred_scores"],
-                             "labels": r["pred_labels"]} for r in existing]
-                    m = compute_map50(gt_records, p4m)
-                else:
+            # Clean baseline (no seeding needed)
+            print("  [clean] ...")
+            clean_records, clean_m, _ = run_condition(
+                predict_fn, image_paths, gt_records, image_ids)
+            out_path = out_dir / f"{model_name}_{which}_clean.json"
+            out_path.write_text(json.dumps(clean_records))
+            print(f"    mAP@0.5 = {clean_m:.4f}  → {out_path.name}")
+
+            # Corrupted conditions (seeded, model-independent corruption)
+            sev_errors: Dict[str, List[float]] = defaultdict(list)
+            for cname in args.corruptions:
+                cfn = CORRUPTION_REGISTRY[cname]
+                for sev in args.severities:
+                    out_path = out_dir / f"{model_name}_{which}_{cname}_{sev}.json"
                     print(f"  [{cname} sev={sev}] ...")
-                    records, m = run_condition(
-                        predict_fn, image_paths, gt_records, image_ids, cfn, sev)
+                    records, m, snr = run_condition(
+                        predict_fn, image_paths, gt_records, image_ids, cfn, sev,
+                        base_seed=args.seed, corr_idx=corr_idx[cname])
                     out_path.write_text(json.dumps(records))
-                sev_errors[cname].append(1.0 - m)
-                print(f"    mAP@0.5 = {m:.4f}  → {out_path.name}")
+                    sev_errors[cname].append(1.0 - m)
+                    # SNR is model-independent: record once (first model only)
+                    if model_name == args.models[0]:
+                        snr_rows.append({
+                            "split": which, "corruption": cname, "severity": sev,
+                            "snr_db": round(snr, 3) if snr is not None else None,
+                        })
+                    print(f"    mAP@0.5 = {m:.4f}  SNR = "
+                          f"{('%.1f dB' % snr) if snr is not None else 'n/a'}"
+                          f"  → {out_path.name}")
 
-        # mCE
-        e_clean = max(1.0 - clean_map[model_name], 1e-6)
-        for cname in args.corruptions:
-            mce = float(np.mean(sev_errors[cname])) / e_clean
-            all_mce_rows.append({
-                "model": model_name, "corruption": cname,
-                "mCE": round(mce, 4), "clean_map50": round(clean_m, 4),
-                **{f"sev{s}_err": round(sev_errors[cname][i], 4)
-                   for i, s in enumerate(args.severities)},
-            })
-        mean_mce = float(np.mean([r["mCE"] for r in all_mce_rows
-                                  if r["model"] == model_name]))
-        print(f"  mean mCE = {mean_mce:.4f}")
+            # mCE (own-clean; kept for backward-compat, P4 uses absolute degradation)
+            e_clean = max(1.0 - clean_m, 1e-6)
+            for cname in args.corruptions:
+                mce = float(np.mean(sev_errors[cname])) / e_clean
+                all_mce_rows.append({
+                    "split": which, "model": model_name, "corruption": cname,
+                    "mCE": round(mce, 4), "clean_map50": round(clean_m, 4),
+                    **{f"sev{s}_err": round(sev_errors[cname][i], 4)
+                       for i, s in enumerate(args.severities)},
+                })
+            mean_mce = float(np.mean([r["mCE"] for r in all_mce_rows
+                                      if r["model"] == model_name and r["split"] == which]))
+            print(f"  [{which}/{model_name}] mean mCE = {mean_mce:.4f}")
 
-        del predict_fn  # release GPU memory before next model
-        try:
-            import torch, gc
-            torch.cuda.empty_cache(); gc.collect()
-        except Exception:
-            pass
+            del predict_fn  # release GPU memory before next model
+            try:
+                import torch, gc
+                torch.cuda.empty_cache(); gc.collect()
+            except Exception:
+                pass
 
     # ── LLVIP inference (YOLOv8m only) ────────────────────────────────────────
     if not args.skip_llvip and llvip_root is not None:
@@ -476,7 +527,7 @@ def main():
                                     "labels": r["pred_labels"]} for r in llvip_records])
         print(f"  LLVIP mAP@0.5 (person) = {llvip_map:.4f}  → {llvip_out}")
 
-    # ── Write mCE summary ──────────────────────────────────────────────────────
+    # ── Write mCE + SNR summaries ───────────────────────────────────────────────
     if all_mce_rows:
         mce_csv = REPO / "results/corruption_preds/mce_summary.csv"
         with open(mce_csv, "w", newline="") as f:
@@ -484,7 +535,15 @@ def main():
             w.writeheader(); w.writerows(all_mce_rows)
         print(f"\nmCE summary: {mce_csv}")
 
-    print("\nDone. rsync results/corruption_preds/ and results/llvip_transfer_preds.json back to X9.")
+    if snr_rows:
+        snr_csv = REPO / "results/corruption_preds/snr_summary.csv"
+        with open(snr_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(snr_rows[0].keys()))
+            w.writeheader(); w.writerows(snr_rows)
+        print(f"SNR summary: {snr_csv}")
+
+    print("\nDone. rsync results/corruption_preds/ and "
+          "results/llvip_transfer_preds.json back to X9.")
 
 
 if __name__ == "__main__":

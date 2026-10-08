@@ -91,19 +91,32 @@ class MonotoneCalibrationHead(nn.Module):
             nn.Linear(embed_dim, hidden), nn.ReLU(True),
             nn.Linear(hidden, 1),
         )
-        # Initialise so T ≈ 1 (no-op at init: logit_cal ≈ logit_conf)
+        # Initialise so the head is the TRUE identity at init (no-op):
+        # T = softplus(bias) + 1e-4 = 1  ⇒  bias = ln(e^1 − 1) ≈ 0.54132.
+        # (Previously bias=0 gave T=softplus(0)=ln2≈0.693, i.e. the head started
+        #  ALREADY mis-calibrated — spreading confidences toward 0.5 — which is a
+        #  large part of why CACH degraded ECE.  With T=1,b=0 it starts as a pass-
+        #  through and only deviates if the data loss + identity reg justify it.)
         nn.init.constant_(self.T_net[-1].weight, 0.0)
-        nn.init.constant_(self.T_net[-1].bias,   0.0)
+        nn.init.constant_(self.T_net[-1].bias,   0.54132)
         nn.init.constant_(self.b_net[-1].weight,  0.0)
         nn.init.constant_(self.b_net[-1].bias,    0.0)
 
     def forward(self, conf: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
         """conf: (N,) raw confidences; e: (N, embed_dim). Returns calibrated (N,)."""
+        cal, _, _ = self.forward_with_params(conf, e)
+        return cal
+
+    def forward_with_params(
+        self, conf: torch.Tensor, e: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Like forward but also returns (T, b) so the trainer can apply an
+        identity-anchoring regulariser (T→1, b→0)."""
         conf = conf.clamp(1e-6, 1 - 1e-6)
         logit_conf = torch.log(conf / (1.0 - conf))          # (N,)
         T = F.softplus(self.T_net(e)).squeeze(1) + 1e-4      # (N,) > 0
         b = self.b_net(e).squeeze(1)                          # (N,)
-        return torch.sigmoid(T * logit_conf + b)              # (N,)
+        return torch.sigmoid(T * logit_conf + b), T, b        # (N,), (N,), (N,)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +169,18 @@ class CACH(nn.Module):
         e_rep = e.expand(scores.shape[0], -1)
         return self.calib_head(scores, e_rep)
 
+    def calibrate_with_params(
+        self,
+        image: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Like calibrate() but also returns (T, b) for identity regularization."""
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        e = self.embed_net(image)
+        e_rep = e.expand(scores.shape[0], -1)
+        return self.calib_head.forward_with_params(scores, e_rep)
+
     # ------------------------------------------------------------------
     # Serialisation
     # ------------------------------------------------------------------
@@ -205,6 +230,16 @@ def combined_loss(
 ) -> torch.Tensor:
     return ((1 - lambda_focal) * tp_nll_loss(cal_conf, is_tp)
             + lambda_focal * focal_calibration_loss(cal_conf, is_tp, gamma))
+
+
+def identity_reg_loss(T: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Anchor the corruption-adaptive map to the identity calibration (T=1, b=0).
+
+    Penalising deviation from identity makes the head default to a pass-through
+    (no worse than no-calibration) and only move where the data loss provides
+    enough evidence — preventing the head from de-calibrating well-calibrated
+    detectors (the failure mode observed without this term)."""
+    return ((T - 1.0) ** 2 + b ** 2).mean()
 
 
 # ---------------------------------------------------------------------------

@@ -67,25 +67,42 @@ _RES_FACTOR  = {1: 2,  2: 3,  3: 4,  4: 6}      # downscale factor
 # input/output: np.ndarray uint8 HxW or HxWxC
 # ---------------------------------------------------------------------------
 
-def gaussian_noise(img: np.ndarray, severity: int) -> np.ndarray:
+def _as_rng(rng: Optional[np.random.Generator]) -> np.random.Generator:
+    """Return a NumPy Generator; create a fresh default_rng if none supplied.
+
+    Stochastic corruptions take an explicit seeded Generator so that
+    regeneration of the corrupted caches is bit-for-bit reproducible. We never
+    touch the global ``np.random`` state (which would be unseeded / order
+    dependent); see ``run_corruption_eval`` for the per-image seeding scheme.
+    """
+    return rng if rng is not None else np.random.default_rng()
+
+
+def gaussian_noise(img: np.ndarray, severity: int,
+                   rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    rng = _as_rng(rng)
     std = _GAUSS_STD[severity]
-    noise = np.random.normal(0, std, img.shape).astype(np.float32)
+    noise = rng.normal(0, std, img.shape).astype(np.float32)
     return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
 
-def poisson_noise(img: np.ndarray, severity: int) -> np.ndarray:
+def poisson_noise(img: np.ndarray, severity: int,
+                  rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    rng = _as_rng(rng)
     lam = _POISSON_LAM[severity]
     # Scale image to [0, lam], apply Poisson, scale back
     scale = lam / 255.0
-    noisy = np.random.poisson(img.astype(np.float32) * scale).astype(np.float32)
+    noisy = rng.poisson(img.astype(np.float32) * scale).astype(np.float32)
     return np.clip(noisy / scale, 0, 255).astype(np.uint8)
 
 
-def impulse_noise(img: np.ndarray, severity: int) -> np.ndarray:
+def impulse_noise(img: np.ndarray, severity: int,
+                  rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    rng = _as_rng(rng)
     p = _IMPULSE_P[severity]
     out = img.copy()
-    mask = np.random.random(img.shape[:2]) < p
-    vals = np.random.choice([0, 255], size=mask.sum())
+    mask = rng.random(img.shape[:2]) < p
+    vals = rng.choice([0, 255], size=int(mask.sum()))
     if img.ndim == 3:
         out[mask] = vals[:, None]
     else:
@@ -93,7 +110,8 @@ def impulse_noise(img: np.ndarray, severity: int) -> np.ndarray:
     return out
 
 
-def motion_blur(img: np.ndarray, severity: int) -> np.ndarray:
+def motion_blur(img: np.ndarray, severity: int,
+                rng: Optional[np.random.Generator] = None) -> np.ndarray:
     k = _BLUR_K[severity]
     kernel = np.zeros((k, k), dtype=np.float32)
     kernel[k // 2, :] = 1.0 / k  # horizontal
@@ -110,10 +128,12 @@ def motion_blur(img: np.ndarray, severity: int) -> np.ndarray:
     return out
 
 
-def fog(img: np.ndarray, severity: int) -> np.ndarray:
+def fog(img: np.ndarray, severity: int,
+        rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """Koschmieder model adapted for IR: I_corrupt = T*I + (1-T)*128.
     T < 1 attenuates contrast; mean is preserved near 128 (midpoint).
     This is more realistic for LWIR thermal than additive white fog.
+    Deterministic (``rng`` accepted for a uniform registry signature).
     """
     T = _FOG_T[severity]
     mid = 128.0
@@ -121,8 +141,9 @@ def fog(img: np.ndarray, severity: int) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def resolution(img: np.ndarray, severity: int) -> np.ndarray:
-    """Bicubic downsample by factor, then upsample back."""
+def resolution(img: np.ndarray, severity: int,
+               rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    """Bicubic downsample by factor, then upsample back. Deterministic."""
     f = _RES_FACTOR[severity]
     h, w = img.shape[:2]
     small_h, small_w = max(1, h // f), max(1, w // f)
@@ -148,6 +169,36 @@ CORRUPTION_REGISTRY: Dict[str, Any] = {
     "fog":            fog,
     "resolution":     resolution,
 }
+
+_STOCHASTIC = {"gaussian_noise", "poisson_noise", "impulse_noise"}
+
+
+# ---------------------------------------------------------------------------
+# Signal-to-noise quantification
+# ---------------------------------------------------------------------------
+
+def image_snr_db(clean: np.ndarray, corrupt: np.ndarray) -> float:
+    """SNR in dB treating the clean image as signal and (corrupt-clean) as the
+    perturbation: SNR = 10 log10( ||clean||^2 / ||corrupt-clean||^2 ).
+
+    A larger SNR means a milder corruption; identical images give +inf. This is
+    the standard reconstruction SNR and lets us report the actual signal
+    degradation each corruption/severity inflicts, rather than only its label.
+    """
+    c = clean.astype(np.float64)
+    d = corrupt.astype(np.float64) - c
+    sig = float(np.sum(c * c))
+    noise = float(np.sum(d * d))
+    if noise <= 0.0:
+        return float("inf")
+    return 10.0 * math.log10(sig / noise)
+
+
+def mean_snr_db(clean_imgs: List[np.ndarray], corrupt_imgs: List[np.ndarray]) -> float:
+    """Mean per-image SNR (dB) over a list, ignoring infinite (identical) cases."""
+    vals = [image_snr_db(c, x) for c, x in zip(clean_imgs, corrupt_imgs)]
+    finite = [v for v in vals if math.isfinite(v)]
+    return float(np.mean(finite)) if finite else float("inf")
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +271,7 @@ def run_corruption_eval(
     iou_threshold: float = 0.5,
     conf_threshold: float = 0.001,
     clean_map: Optional[float] = None,
+    seed: int = 0,
 ) -> Dict:
     """Run corruption robustness evaluation.
 
@@ -245,6 +297,11 @@ def run_corruption_eval(
     corr_names = corruption_types or list(CORRUPTION_REGISTRY.keys())
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    # Stable integer per corruption type, used in the per-image SeedSequence so
+    # that each (seed, corruption, severity, image) draws an independent but
+    # reproducible noise realisation.
+    corr_seed_idx = {n: i for i, n in enumerate(CORRUPTION_REGISTRY)}
 
     def _load_image(p: str) -> np.ndarray:
         if _CV2:
@@ -294,14 +351,27 @@ def run_corruption_eval(
 
         for sev in severities:
             print(f"  [{cname} sev={sev}] corrupting + predicting ...")
-            corr_imgs = [fn(img, sev) for img in clean_imgs]
+            if cname in _STOCHASTIC:
+                corr_imgs = []
+                for i, img in enumerate(clean_imgs):
+                    ss = np.random.SeedSequence([seed, corr_seed_idx[cname], sev, i])
+                    corr_imgs.append(fn(img, sev, np.random.default_rng(ss)))
+            else:
+                corr_imgs = [fn(img, sev) for img in clean_imgs]
+            snr = mean_snr_db(clean_imgs, corr_imgs)
             corr_preds = _predict_batch(corr_imgs)
             metrics = _compute_map(gt_records, corr_preds, iou_threshold)
+            metrics = {**metrics,
+                       "snr_db": round(snr, 3),
+                       "map_drop": round(clean_metrics["mAP50"] - metrics["mAP50"], 4)}
             corruption_results[cname][sev] = metrics
             sev_errors.append(1.0 - metrics["mAP50"])
-            print(f"    mAP@0.5 = {metrics['mAP50']:.4f}")
+            print(f"    mAP@0.5 = {metrics['mAP50']:.4f}  SNR = {snr:.1f} dB")
 
-        # mCE = mean(E_corrupted / E_clean) across severities
+        # mCE = mean(E_corrupted / E_clean) across severities (per own clean).
+        # NOTE: this own-clean normalisation is retained for backward
+        # compatibility only; the unbiased absolute degradation (map_drop) and
+        # a shared-baseline relative metric are reported by the P4 analysis.
         e_clean = max(1.0 - clean_map, 1e-6)
         mce = float(np.mean(sev_errors)) / e_clean
         mce_per_corr[cname] = round(mce, 4)
@@ -335,6 +405,18 @@ def run_corruption_eval(
         w.writerow(["mean_mCE"] + [""] * len(severities) + [round(mean_mce, 4)])
     print(f"  mCE CSV: {csv_path}")
 
+    # SNR + absolute-degradation summary (unbiased, model-independent signal).
+    snr_path = out / "snr_summary.csv"
+    with open(snr_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["corruption", "severity", "snr_db", "mAP50", "map_drop"])
+        for cname in corr_names:
+            for s in severities:
+                m = corruption_results[cname][s]
+                w.writerow([cname, s, m.get("snr_db"), round(m["mAP50"], 4),
+                            m.get("map_drop")])
+    print(f"  SNR CSV: {snr_path}")
+
     return results
 
 
@@ -348,8 +430,20 @@ if __name__ == "__main__":
 
     for name, fn in CORRUPTION_REGISTRY.items():
         for s in [1, 2, 3, 4]:
-            out = fn(img, s)
+            out = fn(img, s, np.random.default_rng(0))
             assert out.shape == img.shape, f"{name} sev={s}: shape mismatch"
             assert out.dtype == np.uint8, f"{name} sev={s}: dtype mismatch"
         print(f"  {name}: OK (sev 1-4)")
-    print("All corruption functions pass shape/dtype checks.")
+
+    # Reproducibility: same seed -> identical output for the stochastic ones.
+    for name in _STOCHASTIC:
+        fn = CORRUPTION_REGISTRY[name]
+        a = fn(img, 3, np.random.default_rng(123))
+        b = fn(img, 3, np.random.default_rng(123))
+        c = fn(img, 3, np.random.default_rng(456))
+        assert np.array_equal(a, b), f"{name}: same seed must reproduce"
+        assert not np.array_equal(a, c), f"{name}: different seed must differ"
+        snr = image_snr_db(img, a)
+        print(f"  {name}: seeded reproducible (SNR@sev3 = {snr:.1f} dB)")
+
+    print("All corruption functions pass shape/dtype/seed/SNR checks.")

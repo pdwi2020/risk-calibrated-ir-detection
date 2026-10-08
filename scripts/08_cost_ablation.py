@@ -1,11 +1,11 @@
 """Cost-ratio ablation: c_FN x c_FP grid, all 4 detectors.
-Run from project root: python /tmp/mv_paper_scripts/08_cost_ablation.py
+Run from project root: python scripts/08_cost_ablation.py
 """
 from __future__ import annotations
 import csv, json, sys
 from pathlib import Path
 
-REPO = Path("/Volumes/Crucial X9/Research Projects/MV_Paper")
+REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from src.risk.cost_sensitive import CostSensitiveThreshold
 

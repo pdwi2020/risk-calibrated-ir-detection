@@ -373,15 +373,19 @@ def fig5_conformal():
     print("[fig5] conformal risk curve (loading calib JSONs) …")
     calib = load_cached(YOLO_CALIB)
     cp, cg = to_preds_gts(calib)
-    n_cal = sum(len(gt.get("boxes", [])) for gt in cg)
+    # Scene-level conformal: n = number of GT-bearing images (exchangeable unit),
+    # NOT the box count. crc._n_images encapsulates this.
+    _crc = ConformalRiskController(alpha=0.10, iou_threshold=0.5)
+    n_cal = _crc._n_images(cg)
 
     print("  sweeping lambda …")
     lam_grid, miss_rates = conformal_sweep(cp, cg)
 
     alpha = 0.10
-    lam_hat = crc_lambda(lam_grid, miss_rates, n_cal, alpha)
-    # adjusted bound: (n*R+1)/(n+1)
+    lam_hat = crc_lambda(lam_grid, miss_rates, n_cal, alpha)  # None at alpha=0.10
+    # finite-sample-corrected bound: (n*R+1)/(n+1)
     adjusted = (n_cal * miss_rates + 1) / (n_cal + 1)
+    floor = float(np.min(adjusted))  # smallest certifiable alpha (miss floor)
 
     fig, ax = plt.subplots(figsize=(3.5, 2.8))
 
@@ -392,30 +396,29 @@ def fig5_conformal():
             linestyle="--",
             label=r"$(n\hat{R}+1)/(n+1)$", zorder=5)
 
-    # alpha line
+    # alpha=0.10 target line (never reached -> infeasible at scene level)
     ax.axhline(alpha, color="k", linestyle=":", linewidth=1.0, zorder=5)
-    ax.text(0.85, alpha + 0.004, r"$\alpha=0.10$", fontsize=7.5, ha="right")
+    ax.text(0.97, alpha + 0.01, r"$\alpha=0.10$ (infeasible)",
+            fontsize=7.0, ha="right")
 
-    # lambda_hat marker
-    if lam_hat is not None:
-        miss_at_lam = miss_rates[list(lam_grid).index(lam_hat)]
-        ax.axvline(lam_hat, color=IEEE_GREEN, linestyle="-.", linewidth=1.2, zorder=4)
-        ax.scatter([lam_hat], [miss_at_lam], color=IEEE_GREEN, zorder=6, s=30)
-        ax.text(lam_hat + 0.01, miss_at_lam + 0.005,
-                rf"$\hat{{\lambda}}$={lam_hat}", fontsize=7.5, color=IEEE_GREEN)
+    # miss floor: smallest alpha that could ever be certified
+    ax.axhline(floor, color=IEEE_GREEN, linestyle="-.", linewidth=1.2, zorder=4)
+    ax.text(0.97, floor + 0.012, rf"miss floor $={floor:.3f}$",
+            fontsize=7.0, ha="right", color=IEEE_GREEN)
 
     ax.set_xlabel(r"Threshold $\lambda$")
-    ax.set_ylabel("Miss-rate")
-    ax.set_xlim(0, 0.5)
-    ax.set_ylim(0, 0.5)
-    ax.legend(loc="upper right")
-    ax.set_title("Conformal Risk Control — YOLOv8m (calib split)")
+    ax.set_ylabel("Per-image miss-rate")
+    ax.set_xlim(0, 1.0)
+    ax.set_ylim(0, 1.0)
+    ax.legend(loc="upper left")
+    ax.set_title("Scene-level Conformal Risk — YOLOv8m (calib)")
     ax.grid(linestyle="--", linewidth=0.4, alpha=0.4, zorder=0)
     clean_ax(ax)
 
     fig.savefig(OUT / "fig5_conformal.pdf")
     plt.close(fig)
-    print("  → fig5_conformal.pdf")
+    print(f"  → fig5_conformal.pdf (n_cal_img={n_cal}, miss_floor={floor:.3f}, "
+          f"lam_hat@0.10={lam_hat})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -423,9 +426,18 @@ def fig5_conformal():
 # ══════════════════════════════════════════════════════════════════════════════
 def fig6_raap_vs_map():
     print("[fig6] RA-AP vs mAP scatter …")
-    detectors = ["YOLOv8m", "RT-DETR", "Faster R-CNN", "RetinaNet"]
-    map50  = [0.7686, 0.7721, 0.7153, 0.6176]
-    raap   = [0.5433, 0.5587, 0.4239, 0.2435]
+    import csv as _csv
+    detectors  = ["YOLOv8m", "RT-DETR", "Faster R-CNN", "RetinaNet"]
+    model_keys = ["yolov8m", "rtdetr", "faster_rcnn", "retinanet"]
+    # Load computed values from results/raap_variants.csv (global / clean variant)
+    # so the figure traces to a regenerated results file (no hardcoded numbers).
+    vals = {}
+    with open(RESULTS / "raap_variants.csv", newline="") as _f:
+        for row in _csv.DictReader(_f):
+            if row["variant"] == "global":
+                vals[row["model"]] = (float(row["map50"]), float(row["raap"]))
+    map50  = [vals[k][0] for k in model_keys]
+    raap   = [vals[k][1] for k in model_keys]
     colors = [IEEE_BLUE, IEEE_GREEN, IEEE_RED, IEEE_ORANGE]
 
     fig, ax = plt.subplots(figsize=(3.5, 2.8))

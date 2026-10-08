@@ -9,7 +9,7 @@ internally (stores results under project/name/).  This script:
 
 Usage (from project root):
     python scripts/01_train_yolo.py \\
-        --flir-root /Volumes/Crucial\\ X9/Research\\ Projects/MV_Paper/datasets/flir_adas_v2/FLIR_ADAS_v2 \\
+        --flir-root /path/to/FLIR_ADAS_v2 \\
         --data-yaml configs/flir_yolo.yaml \\
         --ckpt-dir ./checkpoints \\
         --epochs 100 \\
@@ -50,10 +50,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--flir-root",
-        default=(
-            "/Volumes/Crucial X9/Research Projects/MV_Paper"
-            "/datasets/flir_adas_v2/FLIR_ADAS_v2"
-        ),
+        default="datasets/flir_adas_v2/FLIR_ADAS_v2",
         help="Path to FLIR_ADAS_v2 root directory.",
     )
     p.add_argument(

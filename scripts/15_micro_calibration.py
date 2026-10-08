@@ -164,38 +164,37 @@ def run_micro_calibration(repo: Path) -> List[Dict]:
 
         for seed in range(seeds_to_use):
             if frac == 0:
-                # Zero-shot: no calibration, use raw scores; optimize θ on test only
-                # (pessimistic: cannot optimise without any target data)
+                # Zero-shot: no target-domain data, so no calibration and no
+                # threshold optimisation is possible; use raw scores at theta=0.5.
                 ece_val = ece_metric(test_s, test_tp)
                 cost_opt = cs.compute_cost(test_preds, test_gt, conf_threshold=0.5)
                 theta_star = 0.5
                 cost_red = 0.0
-                raap = 0.0  # placeholder
-            elif frac == 100:
-                sub_recs = calib_recs
-                _, _, cal_s, cal_tp = records_to_cal_format(sub_recs)
-                ir = IsotonicRegression(out_of_bounds="clip").fit(cal_s, cal_tp)
-                cal_test_preds = apply_calibrator(ir, test_preds)
-                cal_test_s = ir.predict(test_s)
-                ece_val = ece_metric(cal_test_s, test_tp)
-                theta_star, cost_opt = cs.optimize_threshold(cal_test_preds, test_gt,
-                                                              THETA_SWEEP)
-                cost_red = (cost_base - cost_opt) / max(cost_base, 1e-6) * 100.0
-                raap = 0.0
             else:
-                rng = random.Random(seed)
-                sub_recs = rng.sample(calib_recs, n_sample)
-                _, _, cal_s, cal_tp = records_to_cal_format(sub_recs)
+                # Leakage-free: FIT the isotonic map AND theta* on the
+                # calibration subsample; REPORT ECE and cost only on the
+                # disjoint test split.
+                if frac == 100:
+                    sub_recs = calib_recs
+                else:
+                    rng = random.Random(seed)
+                    sub_recs = rng.sample(calib_recs, n_sample)
+                sub_preds, sub_gt, cal_s, cal_tp = records_to_cal_format(sub_recs)
                 if len(cal_s) == 0:
                     continue
                 ir = IsotonicRegression(out_of_bounds="clip").fit(cal_s, cal_tp)
+
+                # theta* chosen on the calibrated CALIBRATION subsample
+                cal_sub_preds = apply_calibrator(ir, sub_preds)
+                theta_star, _ = cs.optimize_threshold(cal_sub_preds, sub_gt,
+                                                       THETA_SWEEP)
+                # ECE and cost reported on the calibrated TEST split at that theta*
                 cal_test_preds = apply_calibrator(ir, test_preds)
                 cal_test_s = ir.predict(test_s)
                 ece_val = ece_metric(cal_test_s, test_tp)
-                theta_star, cost_opt = cs.optimize_threshold(cal_test_preds, test_gt,
-                                                              THETA_SWEEP)
+                cost_opt = cs.compute_cost(cal_test_preds, test_gt,
+                                           conf_threshold=theta_star)
                 cost_red = (cost_base - cost_opt) / max(cost_base, 1e-6) * 100.0
-                raap = 0.0
 
             rows.append({
                 "frac_pct":   frac,

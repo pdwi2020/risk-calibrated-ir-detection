@@ -36,11 +36,27 @@ sys.path.insert(0, str(REPO))
 
 import numpy as np
 from src.risk.cost_sensitive import CostSensitiveThreshold
-from src.corruption.corruption_pipeline import CORRUPTION_REGISTRY
+from src.corruption.corruption_pipeline import CORRUPTION_REGISTRY, _compute_map
+
+ALL_VARIANTS = ["global", "person_weighted", "corruption_avg", "domain_llvip"]
+
+
+def _corr_cache(preds_dir: Path, model: str, split: str, cname: str, sev: int) -> Path:
+    """Per-split corrupted cache path with fallback to the legacy (test-only) name."""
+    p = preds_dir / f"{model}_{split}_{cname}_{sev}.json"
+    return p if p.exists() else preds_dir / f"{model}_{cname}_{sev}.json"
+
+
+def _split_pg(recs):
+    """records -> (preds, gts) in {boxes,scores,labels} / {boxes,labels} form."""
+    preds = [{"boxes": r["pred_boxes"], "scores": r["pred_scores"],
+              "labels": r["pred_labels"]} for r in recs]
+    gts = [{"boxes": r["gt_boxes"], "labels": r["gt_labels"]} for r in recs]
+    return preds, gts
+
 
 DETECTORS = {
     "yolov8m":     "yolov8m",
-    "yolov11m":    "yolov11m",
     "rtdetr":      "rtdetr",
     "faster_rcnn": "frcnn",
     "retinanet":   "retinanet",
@@ -74,17 +90,23 @@ def load_map50(path: Path) -> float:
 def compute_raap(cs: CostSensitiveThreshold,
                  calib_preds, calib_gt,
                  test_preds, test_gt, map50: float) -> Dict:
+    """Leakage-free RA-AP: fit theta* on the CALIBRATION (preds,gt), evaluate the
+    per-image cost on the disjoint TEST split, and discount mAP by the normalised
+    risk rho = per_image_cost / (c_FN * mean_gt_per_image) (density-invariant)."""
     theta, _ = cs.optimize_threshold(calib_preds, calib_gt, THETA_SWEEP)
     cost_total = cs.compute_cost(test_preds, test_gt, theta)
-    # RA-AP = mAP - alpha * E[C]/n  (per-image cost, matching paper definition)
     n = max(len(test_preds), 1)
     cost_per_img = cost_total / n
-    raap = cs.risk_adjusted_ap(map50, cost_per_img)
+    gbar = cs.mean_gt_per_image(test_gt)
+    raap = cs.risk_adjusted_ap(map50, cost_per_img, gbar)
+    rho = cost_per_img / (cs.c_fn * max(gbar, 1e-9))
     return {"theta_star": round(theta, 2), "cost": round(cost_per_img, 4),
+            "rho": round(rho, 4), "gbar": round(gbar, 3),
             "raap": round(raap, 4), "map50": round(map50, 4)}
 
 
-def run_analysis(repo: Path):
+def run_analysis(repo: Path, variants=None):
+    variants = set(variants or ALL_VARIANTS)
     preds_dir = repo / "results/corruption_preds"
     llvip_path = repo / "results/llvip_transfer_preds.json"
 
@@ -105,42 +127,46 @@ def run_analysis(repo: Path):
         if not calib_p:
             print(f"  [{model_name}] missing eval files — skipping."); continue
 
-        # 1. Global (clean, standard cost)
+        # 1. Global (clean, standard cost): theta* on clean calib, eval clean test
         cs_std = CostSensitiveThreshold(c_fn=10, c_fp=1)
-        v_global = compute_raap(cs_std, calib_p, calib_g, test_p, test_g, map50)
-        variant_results[model_name]["global"] = v_global
-        print(f"  [{model_name}] global  mAP={map50:.4f}  RA-AP={v_global['raap']:.4f}")
+        if "global" in variants:
+            v_global = compute_raap(cs_std, calib_p, calib_g, test_p, test_g, map50)
+            variant_results[model_name]["global"] = v_global
+            print(f"  [{model_name}] global  mAP={map50:.4f}  RA-AP={v_global['raap']:.4f} "
+                  f"(rho={v_global['rho']}, gbar={v_global['gbar']})")
 
-        # 2. Person-weighted (c_FN=15 for person class)
-        cs_person = CostSensitiveThreshold(c_fn=15, c_fp=1)
-        v_person = compute_raap(cs_person, calib_p, calib_g, test_p, test_g, map50)
-        variant_results[model_name]["person_weighted"] = v_person
+        # 2. Person-weighted (c_FN=15)
+        if "person_weighted" in variants:
+            cs_person = CostSensitiveThreshold(c_fn=15, c_fp=1)
+            v_person = compute_raap(cs_person, calib_p, calib_g, test_p, test_g, map50)
+            variant_results[model_name]["person_weighted"] = v_person
+            print(f"  [{model_name}] person  RA-AP={v_person['raap']:.4f}")
 
-        # 3. Corruption (averaged RA-AP over all conditions)
-        if preds_dir.exists():
-            raap_corr_vals = []
+        # 3. Corruption (mean RA-AP over 6x4 conditions, LEAKAGE-FREE):
+        #    theta* on the CALIBRATION corrupted cache, cost + corrupted mAP on TEST.
+        if "corruption_avg" in variants and preds_dir.exists():
+            raap_corr_vals, corr_maps = [], []
             for cname in CORRUPTION_REGISTRY:
                 for sev in [1, 2, 3, 4]:
-                    rec_path = preds_dir / f"{model_name}_{cname}_{sev}.json"
-                    if not rec_path.exists():
+                    cal_path  = _corr_cache(preds_dir, model_name, "calibration", cname, sev)
+                    test_path = _corr_cache(preds_dir, model_name, "test", cname, sev)
+                    if not cal_path.exists() or not test_path.exists():
                         continue
-                    recs = json.loads(rec_path.read_text())
-                    cp = [{"boxes": r["pred_boxes"], "scores": r["pred_scores"],
-                           "labels": r["pred_labels"]} for r in recs]
-                    cg = [{"boxes": r["gt_boxes"], "labels": r["gt_labels"]}
-                          for r in recs]
-                    # Use pooled clean+corrupt preds as calib for θ* (no oracle leak)
-                    v = compute_raap(cs_std, calib_p + cp, calib_g + cg, cp, cg, map50)
-                    raap_corr_vals.append(v["raap"])
+                    cal_cp, cal_cg = _split_pg(json.loads(cal_path.read_text()))
+                    tst_cp, tst_cg = _split_pg(json.loads(test_path.read_text()))
+                    corr_map = _compute_map(tst_cg, tst_cp, 0.5)["mAP50"]
+                    v = compute_raap(cs_std, cal_cp, cal_cg, tst_cp, tst_cg, corr_map)
+                    raap_corr_vals.append(v["raap"]); corr_maps.append(corr_map)
             if raap_corr_vals:
-                avg_raap_corr = float(np.mean(raap_corr_vals))
                 variant_results[model_name]["corruption_avg"] = {
-                    "raap": round(avg_raap_corr, 4), "map50": round(map50, 4),
+                    "raap": round(float(np.mean(raap_corr_vals)), 4),
+                    "map50": round(float(np.mean(corr_maps)), 4),
                     "theta_star": None, "cost": None}
-                print(f"  [{model_name}] corruption avg RA-AP={avg_raap_corr:.4f}")
+                print(f"  [{model_name}] corruption-avg  mAP={np.mean(corr_maps):.4f}  "
+                      f"RA-AP={np.mean(raap_corr_vals):.4f}")
 
         # 4. Domain (LLVIP zero-shot)
-        if llvip_path.exists():
+        if "domain_llvip" in variants and llvip_path.exists():
             recs_llvip = json.loads(llvip_path.read_text())
             # Use only test split portion
             split_json = json.loads(
@@ -162,9 +188,8 @@ def run_analysis(repo: Path):
                 print(f"  [{model_name}] domain(LLVIP) RA-AP={v_domain['raap']:.4f}")
 
     # ── Build raap_variants rows ───────────────────────────────────────────
-    variants = ["global", "person_weighted", "corruption_avg", "domain_llvip"]
     for model_name in DETECTORS:
-        for variant in variants:
+        for variant in ALL_VARIANTS:
             v = variant_results[model_name].get(variant)
             if v is None:
                 continue
@@ -175,7 +200,7 @@ def run_analysis(repo: Path):
             })
 
     # ── Build ranking divergence table ────────────────────────────────────
-    for variant in variants:
+    for variant in ALL_VARIANTS:
         vdata = [(m, variant_results[m].get(variant, {}).get("raap"),
                   variant_results[m].get(variant, {}).get("map50"))
                  for m in DETECTORS if variant_results[m].get(variant)]
@@ -187,6 +212,17 @@ def run_analysis(repo: Path):
         models_v = [x[0] for x in vdata]
         raaps_v  = [x[1] for x in vdata]
         map50s_v = [x[2] for x in vdata]
+
+        # A ranking requires variation in the reference metric.  Some variants
+        # (e.g. domain_llvip) use a single shared transfer AP rather than a
+        # per-detector mAP measurement; then every detector ties at the same
+        # mAP, the mAP ranking is undefined, and any apparent "inversion" is an
+        # artifact of comparing a varying RA-AP against a constant.  Skip these.
+        if len({round(mp, 4) for mp in map50s_v}) < 2:
+            print(f"  [{variant}] mAP identical across detectors "
+                  f"(={map50s_v[0]:.4f}) — mAP ranking undefined, variant "
+                  f"excluded from divergence table.")
+            continue
 
         map_ranks  = [sorted(map50s_v, reverse=True).index(mp) + 1 for mp in map50s_v]
         raap_ranks = [sorted(raaps_v,  reverse=True).index(rp) + 1 for rp in raaps_v]
@@ -211,11 +247,16 @@ def run_analysis(repo: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=str(REPO))
+    ap.add_argument("--variants", nargs="+", default=ALL_VARIANTS,
+                    choices=ALL_VARIANTS,
+                    help="Which RA-AP variants to compute. Clean variants "
+                         "(global, person_weighted) need no corrupted caches; "
+                         "corruption_avg/domain_llvip require the P3 caches.")
     args = ap.parse_args()
     repo = Path(args.root)
 
-    print("Running RA-AP variants + ranking divergence ...")
-    raap_rows, rank_rows = run_analysis(repo)
+    print(f"Running RA-AP variants {args.variants} + ranking divergence ...")
+    raap_rows, rank_rows = run_analysis(repo, variants=args.variants)
 
     if not raap_rows:
         sys.exit("No data.")

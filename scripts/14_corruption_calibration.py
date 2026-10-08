@@ -40,7 +40,6 @@ from src.corruption.corruption_pipeline import CORRUPTION_REGISTRY
 
 DETECTORS = {
     "yolov8m":     "yolov8m",
-    "yolov11m":    "yolov11m",
     "rtdetr":      "rtdetr",
     "faster_rcnn": "frcnn",
     "retinanet":   "retinanet",
@@ -58,6 +57,17 @@ def load_preds_json(path: Path) -> List[Dict]:
     if not path.exists():
         return []
     return json.loads(path.read_text())
+
+
+def cache_path(preds_dir: Path, model: str, split: str,
+               cname=None, sev: int = 0) -> Path:
+    """Per-split corruption cache path, falling back to the legacy (test-only)
+    un-split name so this still runs against pre-P3 caches if needed."""
+    if cname is None:
+        p = preds_dir / f"{model}_{split}_clean.json"
+        return p if p.exists() else preds_dir / f"{model}_clean.json"
+    p = preds_dir / f"{model}_{split}_{cname}_{sev}.json"
+    return p if p.exists() else preds_dir / f"{model}_{cname}_{sev}.json"
 
 
 def extract_scores_labels(records: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
@@ -127,13 +137,14 @@ def run_analysis(repo: Path) -> List[Dict]:
     for model_name, prefix in DETECTORS.items():
         eval_dir   = repo / f"results/{model_name}_flir_seed0/eval"
         calib_json = eval_dir / f"{prefix}_calib_predictions.json"
-        clean_json = preds_dir / f"{model_name}_clean.json"
+        # Gate on the held-out TEST clean cache (eval is reported on TEST).
+        test_clean = cache_path(preds_dir, model_name, "test")
 
-        if not clean_json.exists():
-            print(f"  [{model_name}] clean preds missing — skipping.")
+        if not test_clean.exists():
+            print(f"  [{model_name}] test clean preds missing — skipping.")
             continue
 
-        # ── Fit clean-cal isotonic on original calib split ─────────────────
+        # ── clean-cal isotonic: fit on the CLEAN calibration split ─────────
         if calib_json.exists():
             c_recs = load_preds_json(calib_json)
             c_scores, c_tp = extract_scores_labels(c_recs)
@@ -142,18 +153,19 @@ def run_analysis(repo: Path) -> List[Dict]:
             ir_clean = None
             print(f"  [{model_name}] calib predictions not found; clean-cal unavailable.")
 
-        # ── Fit pooled isotonic over ALL conditions ────────────────────────
+        # ── pooled isotonic: FIT on CALIBRATION (clean + all corruptions),
+        #    leakage-free w.r.t. the test conditions it is scored on ─────────
         pool_s, pool_tp = [], []
         for cname in CORRUPTION_REGISTRY:
             for sev in [1, 2, 3, 4]:
-                rec = load_preds_json(preds_dir / f"{model_name}_{cname}_{sev}.json")
+                rec = load_preds_json(cache_path(preds_dir, model_name, "calibration", cname, sev))
                 if rec:
                     s, tp = extract_scores_labels(rec)
                     pool_s.append(s); pool_tp.append(tp)
-        # include clean in pooled
-        clean_recs = load_preds_json(clean_json)
-        s0, tp0 = extract_scores_labels(clean_recs)
-        pool_s.append(s0); pool_tp.append(tp0)
+        cal_clean = load_preds_json(cache_path(preds_dir, model_name, "calibration"))
+        if cal_clean:
+            s0, tp0 = extract_scores_labels(cal_clean)
+            pool_s.append(s0); pool_tp.append(tp0)
         if pool_s:
             ps = np.concatenate(pool_s); pp = np.concatenate(pool_tp)
             if len(ps) == 0:
@@ -164,13 +176,13 @@ def run_analysis(repo: Path) -> List[Dict]:
             ir_pooled = None
             ps = np.array([])
 
-        print(f"  [{model_name}] pooled cal: {len(ps):,} detections")
+        print(f"  [{model_name}] pooled cal (calibration fit): {len(ps):,} detections")
 
         for cname in CORRUPTION_REGISTRY:
-            # Per-type isotonic regressor (oracle)
+            # Per-type isotonic (oracle): FIT on CALIBRATION corrupted of this type.
             type_s, type_tp = [], []
             for sev in [1, 2, 3, 4]:
-                rec = load_preds_json(preds_dir / f"{model_name}_{cname}_{sev}.json")
+                rec = load_preds_json(cache_path(preds_dir, model_name, "calibration", cname, sev))
                 if rec:
                     s, tp = extract_scores_labels(rec)
                     type_s.append(s); type_tp.append(tp)
@@ -181,7 +193,8 @@ def run_analysis(repo: Path) -> List[Dict]:
                 ir_pertype = None
 
             for sev in [1, 2, 3, 4]:
-                rec = load_preds_json(preds_dir / f"{model_name}_{cname}_{sev}.json")
+                # EVALUATE every protocol on the held-out TEST corrupted condition.
+                rec = load_preds_json(cache_path(preds_dir, model_name, "test", cname, sev))
                 if not rec:
                     continue
                 scores, is_tp = extract_scores_labels(rec)

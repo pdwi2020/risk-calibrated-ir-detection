@@ -164,14 +164,34 @@ class CostSensitiveThreshold:
     def risk_adjusted_ap(
         self,
         map_score: float,
-        expected_cost: float,
-        alpha: float = 0.01,
+        per_image_cost: float,
+        mean_gt_per_image: float,
     ) -> float:
-        """RA-AP = mAP − alpha·E[C] at optimal threshold.
+        """RA-AP = mAP − rho, a cost-discounted average precision.
 
-        Novel metric: penalizes high mAP that comes with high risk (high E[C]).
+        rho = per_image_cost / (c_FN * mean_gt_per_image) is the fraction of the
+        worst-case "detect-nothing" cost still incurred at theta*: if every one
+        of the (mean) ``mean_gt_per_image`` ground-truth objects were missed, the
+        per-image cost would be c_FN * mean_gt_per_image, so rho in [0, ~1].
+
+        This replaces the earlier arbitrary weight (RA-AP = mAP − 0.01·E[C]):
+          * no free constant — the normaliser is the worst-case miss cost;
+          * dimensionless and commensurable with mAP (both ~[0,1]);
+          * DENSITY-INVARIANT — scaling the number of objects per image leaves
+            rho (and hence RA-AP) unchanged, so RA-AP is comparable across
+            datasets / corruption conditions with different object densities.
         """
-        return map_score - alpha * expected_cost
+        denom = self.c_fn * max(float(mean_gt_per_image), 1e-9)
+        rho = per_image_cost / denom
+        return map_score - rho
+
+    @staticmethod
+    def mean_gt_per_image(ground_truths: List[Dict]) -> float:
+        """Mean number of ground-truth boxes per image (the RA-AP normaliser)."""
+        n = len(ground_truths)
+        if n == 0:
+            return 0.0
+        return sum(len(gt.get("boxes", [])) for gt in ground_truths) / n
 
 
 # ----------------------------------------------------------------------------
@@ -197,8 +217,13 @@ if __name__ == "__main__":
     # argmin sweep prefers θ where cost is lowest (<= 10)
     theta, cost = cs.optimize_threshold(pred, gt)
     assert cost <= 10.0 + 1e-6, (theta, cost)
-    # RA-AP sanity: higher cost lowers the score
-    assert cs.risk_adjusted_ap(0.8, 100.0) < cs.risk_adjusted_ap(0.8, 0.0)
+    # RA-AP sanity: higher cost lowers the score; density-invariance holds
+    assert cs.risk_adjusted_ap(0.8, 100.0, 10.0) < cs.risk_adjusted_ap(0.8, 0.0, 10.0)
+    # rho = 50/(10*10)=0.5 -> RA-AP = 0.3
+    assert abs(cs.risk_adjusted_ap(0.8, 50.0, 10.0) - 0.3) < 1e-9
+    # density-invariance: same per-OBJECT cost ratio -> same RA-AP
+    assert abs(cs.risk_adjusted_ap(0.8, 50.0, 10.0)
+               - cs.risk_adjusted_ap(0.8, 100.0, 20.0)) < 1e-9
 
     print("cost_sensitive self-test OK: "
           "C(0.5)=11.0  C(0.7)=10.0  C(0.5,defer)=10.5  argmin=%.1f@θ=%.1f" % (cost, theta))

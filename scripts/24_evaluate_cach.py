@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -36,6 +37,18 @@ from src.corruption.corruption_pipeline import CORRUPTION_REGISTRY
 DETECTORS = ["yolov8m", "rtdetr", "faster_rcnn", "retinanet"]
 IOU_THRESH = 0.5
 N_BINS = 15
+_CORR_IDX = {n: i for i, n in enumerate(CORRUPTION_REGISTRY)}
+
+
+def cache_path(preds_dir: Path, model: str, split: str,
+               cname=None, sev: int = 0) -> Path:
+    """Per-split corruption cache path, falling back to the legacy (test-only,
+    un-split) names so this still runs against pre-P3 caches if needed."""
+    if cname is None:
+        p = preds_dir / f"{model}_{split}_clean.json"
+        return p if p.exists() else preds_dir / f"{model}_clean.json"
+    p = preds_dir / f"{model}_{split}_{cname}_{sev}.json"
+    return p if p.exists() else preds_dir / f"{model}_{cname}_{sev}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -122,13 +135,23 @@ def _build_id2path(flir_root: Path) -> dict:
 
 
 def build_cach_per_image_fn(cach_model: CACH, flir_root: Path, records,
-                             device: str, id2path: dict = None):
-    """Apply CACH per-image using the COCO ID→file mapping."""
+                             device: str, id2path: dict = None,
+                             corr_name=None, severity: int = 0):
+    """Apply CACH per-image using the COCO ID→file mapping.
+
+    CRITICAL FIX: when evaluating a corrupted condition, the SAME corruption
+    (``corr_name`` at ``severity``) is applied to the image BEFORE it is fed to
+    CorruptionEmbedNet -- otherwise CACH sees a clean image and cannot infer the
+    corruption it is meant to adapt to. The corruption is seeded reproducibly
+    (per image/type/severity), an independent draw from the same family that
+    produced the cached predictions.
+    """
     if id2path is None:
         id2path = _build_id2path(flir_root)
     # Fallback: first image in the directory if no mapping available
     data_dir = flir_root / "images_thermal_val" / "data"
     fallback_paths = sorted(data_dir.glob("*.jpg"))
+    cfn = CORRUPTION_REGISTRY[corr_name] if corr_name is not None else None
     cach_model.eval()
 
     all_s, all_tp = [], []
@@ -143,6 +166,10 @@ def build_cach_per_image_fn(cach_model: CACH, flir_root: Path, records,
         g = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
         if g is None:
             continue
+        if cfn is not None:
+            key = f"{img_path}|{corr_name}|{severity}".encode()
+            s_seed = int(hashlib.md5(key).hexdigest()[:8], 16)
+            g = cfn(g, severity, np.random.default_rng(s_seed))
         patch = preprocess_patch(g).to(device)
 
         scores = np.array(rec.get("pred_scores", []), dtype=np.float32)
@@ -179,36 +206,40 @@ def main():
     repo = Path(args.root)
     preds_dir  = repo / "results/corruption_preds"
     flir_root  = repo / "datasets/flir_adas_v2/FLIR_ADAS_v2"
-    cach_path  = repo / args.cach
+    # --cach is kept for backward compatibility but is no longer used; each
+    # detector loads its own per-detector checkpoint inside the loop below.
 
     if not preds_dir.exists():
         sys.exit(f"ERROR: {preds_dir} not found")
-    if not cach_path.exists():
-        sys.exit(f"ERROR: CACH checkpoint not found: {cach_path}")
-
-    print(f"Loading CACH from {cach_path} ...")
-    cach = CACH.load(str(cach_path), map_location=args.device)
-    cach.eval()
-    print(f"  Parameters: {cach.param_count():,}")
 
     id2path = _build_id2path(flir_root)
-    print(f"  COCO ID→path: {len(id2path)} images")
+    print(f"COCO ID→path: {len(id2path)} images")
 
     rows = []
 
     for model_name in DETECTORS:
+        # ── Load per-detector CACH checkpoint ─────────────────────────────
+        ckpt_path = repo / "results/cach" / f"{model_name}_cach_best.pt"
+        if not ckpt_path.exists():
+            print(f"[skip] no CACH checkpoint for {model_name} "
+                  f"(expected: {ckpt_path})")
+            continue
+        print(f"\nLoading CACH for {model_name} from {ckpt_path} ...")
+        cach = CACH.load(str(ckpt_path), map_location=args.device)
+        cach.eval()
+        print(f"  Parameters: {cach.param_count():,}")
         eval_dir   = repo / f"results/{model_name}_flir_seed0/eval"
         prefix_map = {"yolov8m": "yolov8m", "rtdetr": "rtdetr",
                       "faster_rcnn": "frcnn", "retinanet": "retinanet"}
         prefix     = prefix_map[model_name]
         calib_json = eval_dir / f"{prefix}_calib_predictions.json"
-        clean_json = preds_dir / f"{model_name}_clean.json"
+        test_clean = cache_path(preds_dir, model_name, "test")
 
-        if not clean_json.exists():
-            print(f"  [{model_name}] clean preds missing — skipping.")
+        if not test_clean.exists():
+            print(f"  [{model_name}] test clean preds missing — skipping.")
             continue
 
-        # ── Clean-cal isotonic ────────────────────────────────────────────
+        # ── Clean-cal isotonic (fit on CLEAN calibration) ─────────────────
         ir_clean = None
         if calib_json.exists():
             c_recs = load_json(calib_json)
@@ -216,27 +247,29 @@ def main():
             if len(c_s) > 0:
                 ir_clean = fit_iso(c_s, c_tp)
 
-        # ── Pooled-cal isotonic ───────────────────────────────────────────
+        # ── Pooled-cal isotonic: FIT on CALIBRATION (clean + all corruptions),
+        #    leakage-free w.r.t. the test conditions it is scored on. ────────
         pool_s, pool_tp = [], []
         for cname in CORRUPTION_REGISTRY:
             for sev in [1, 2, 3, 4]:
-                recs = load_json(preds_dir / f"{model_name}_{cname}_{sev}.json")
+                recs = load_json(cache_path(preds_dir, model_name, "calibration", cname, sev))
                 if recs:
                     s, tp = extract_scores_labels(recs)
                     pool_s.append(s); pool_tp.append(tp)
-        recs0 = load_json(clean_json)
-        s0, tp0 = extract_scores_labels(recs0)
-        pool_s.append(s0); pool_tp.append(tp0)
+        recs0 = load_json(cache_path(preds_dir, model_name, "calibration"))
+        if recs0:
+            s0, tp0 = extract_scores_labels(recs0)
+            pool_s.append(s0); pool_tp.append(tp0)
         ps = np.concatenate(pool_s) if pool_s else np.array([])
         pp = np.concatenate(pool_tp) if pool_tp else np.array([])
         ir_pooled = fit_iso(ps, pp) if len(ps) > 0 else None
-        print(f"  [{model_name}] pooled: {len(ps):,} dets")
+        print(f"  [{model_name}] pooled (calibration fit): {len(ps):,} dets")
 
         for cname in CORRUPTION_REGISTRY:
-            # Per-type oracle isotonic
+            # Per-type oracle isotonic: FIT on CALIBRATION corrupted of this type.
             ts, ttp_list = [], []
             for sev in [1, 2, 3, 4]:
-                recs = load_json(preds_dir / f"{model_name}_{cname}_{sev}.json")
+                recs = load_json(cache_path(preds_dir, model_name, "calibration", cname, sev))
                 if recs:
                     s, tp = extract_scores_labels(recs)
                     ts.append(s); ttp_list.append(tp)
@@ -244,7 +277,8 @@ def main():
                 if ts else None
 
             for sev in [1, 2, 3, 4]:
-                recs = load_json(preds_dir / f"{model_name}_{cname}_{sev}.json")
+                # EVALUATE on the held-out TEST corrupted condition.
+                recs = load_json(cache_path(preds_dir, model_name, "test", cname, sev))
                 if not recs:
                     continue
                 scores, is_tp = extract_scores_labels(recs)
@@ -256,9 +290,10 @@ def main():
                 ece_pooled = ece(ir_pooled.predict(scores), is_tp) if ir_pooled else float("nan")
                 ece_oracle = ece(ir_oracle.predict(scores), is_tp) if ir_oracle else float("nan")
 
-                # CACH per-image calibration
+                # CACH per-image calibration: corruption APPLIED to the image.
                 cach_s, cach_tp = build_cach_per_image_fn(
-                    cach, flir_root, recs, args.device, id2path=id2path)
+                    cach, flir_root, recs, args.device, id2path=id2path,
+                    corr_name=cname, severity=sev)
                 ece_cach = ece(cach_s, cach_tp) if len(cach_s) > 0 else float("nan")
 
                 rows.append({

@@ -73,10 +73,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--flir-root",
-        default=(
-            "/Volumes/Crucial X9/Research Projects/MV_Paper"
-            "/datasets/flir_adas_v2/FLIR_ADAS_v2"
-        ),
+        default="datasets/flir_adas_v2/FLIR_ADAS_v2",
         help="Path to FLIR_ADAS_v2 root directory.",
     )
     p.add_argument(

@@ -10,7 +10,7 @@ from __future__ import annotations
 import csv, json, random, sys
 from pathlib import Path
 
-REPO = Path("/Volumes/Crucial X9/Research Projects/MV_Paper")
+REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 N_BOOT = 10000

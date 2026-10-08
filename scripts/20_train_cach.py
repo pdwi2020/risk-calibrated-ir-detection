@@ -17,9 +17,9 @@ Training:
   - Eval after each epoch: ECE on held-out FLIR test split (all corruptions).
 
 Outputs:
-  results/cach/cach_best.pt          — best checkpoint by val ECE
-  results/cach/cach_final.pt         — final epoch checkpoint
-  results/cach/training_log.csv      — epoch, train_loss, val_ece, val_loss
+  results/cach/{model}_cach_best.pt   — best checkpoint by val ECE (per detector)
+  results/cach/{model}_cach_final.pt  — final epoch checkpoint (per detector)
+  results/cach/training_log.csv       — epoch, train_loss, val_ece, val_loss
 
 Usage (from project root on GPU node):
     python scripts/20_train_cach.py \\
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
@@ -95,6 +96,7 @@ class CACHDataset(Dataset):
         preds_dir: Path,
         split_ids: List,              # image IDs (int) for this split
         model_name: str = "yolov8m",
+        split_name: str = "calibration",  # which per-split caches to read
         include_clean: bool = True,
         corruption_names: List[str] = None,
         severities: List[int] = None,
@@ -102,8 +104,9 @@ class CACHDataset(Dataset):
         seed: int = 42,
     ):
         self.patch_size = patch_size
-        self.items: List[Tuple[str, any, float, float]] = []
-        # (image_path, corruption_fn_or_None, severity, raw_conf, is_tp)
+        self.split_name = split_name
+        # (image_path, corruption_name_or_None, severity, raw_conf, is_tp)
+        self.items: List[Tuple[str, any, int, float, float]] = []
 
         test_id_set = set(split_ids)
         coco_ann = flir_root / "images_thermal_val/coco.json"
@@ -130,11 +133,14 @@ class CACHDataset(Dataset):
 
         for corr_name, sev in corruption_list:
             if corr_name is None:
-                pred_file = preds_dir / f"{model_name}_clean.json"
-                cfn = None
+                # per-split clean cache; fall back to legacy name for compat
+                pred_file = preds_dir / f"{model_name}_{split_name}_clean.json"
+                if not pred_file.exists():
+                    pred_file = preds_dir / f"{model_name}_clean.json"
             else:
-                pred_file = preds_dir / f"{model_name}_{corr_name}_{sev}.json"
-                cfn = CORRUPTION_REGISTRY[corr_name]
+                pred_file = preds_dir / f"{model_name}_{split_name}_{corr_name}_{sev}.json"
+                if not pred_file.exists():
+                    pred_file = preds_dir / f"{model_name}_{corr_name}_{sev}.json"
             if not pred_file.exists():
                 continue
             records = json.loads(pred_file.read_text())
@@ -155,7 +161,8 @@ class CACHDataset(Dataset):
                 _, is_tp_arr = match_detections_to_gt(
                     pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels)
                 for score, tp in zip(pred_scores, is_tp_arr):
-                    self.items.append((str(fpath), cfn, sev, float(score), float(tp)))
+                    # store corruption NAME (not fn) so __getitem__ can seed it
+                    self.items.append((str(fpath), corr_name, sev, float(score), float(tp)))
 
         rng = random.Random(seed)
         rng.shuffle(self.items)
@@ -165,7 +172,7 @@ class CACHDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, idx: int):
-        img_path, cfn, sev, score, is_tp = self.items[idx]
+        img_path, corr_name, sev, score, is_tp = self.items[idx]
         try:
             import cv2
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
@@ -174,8 +181,15 @@ class CACHDataset(Dataset):
         except Exception:
             from PIL import Image
             img = np.array(Image.open(img_path).convert("L"))
-        if cfn is not None:
-            img = cfn(img, sev)
+        if corr_name is not None:
+            cfn = CORRUPTION_REGISTRY[corr_name]
+            # Deterministic per-(image, corruption, severity) seed so the
+            # CorruptionEmbedNet input is reproducible. This is an independent
+            # noise draw from the same corruption family/severity that produced
+            # the cached (score, is_TP) pair -- a valid, augmentation-like input.
+            key = f"{img_path}|{corr_name}|{sev}".encode()
+            s = int(hashlib.md5(key).hexdigest()[:8], 16)
+            img = cfn(img, sev, np.random.default_rng(s))
         patch = preprocess_patch(img, self.patch_size)  # (1,1,H,W)
         return patch.squeeze(0), torch.tensor(score, dtype=torch.float32), \
                torch.tensor(is_tp, dtype=torch.float32)
@@ -190,14 +204,25 @@ def collate_fn(batch):
 # Load FLIR split
 # ---------------------------------------------------------------------------
 
-def load_split(split_json: Path):
-    data = json.loads(split_json.read_text())
-    return data["test"]   # use test split as training data for CACH
-
-
 def load_calib_split(split_json: Path):
     data = json.loads(split_json.read_text())
     return data.get("calibration", data.get("calib", []))
+
+
+def calib_train_val(split_json: Path, val_frac: float = 0.15, seed: int = 42):
+    """Split the CALIBRATION ids into train / val for leakage-free CACH fitting.
+
+    CACH is trained and model-selected entirely within the calibration split;
+    the TEST split is never seen during training and is reported only by
+    24_evaluate_cach.py. This removes the original leak (training on test).
+    """
+    ids = sorted(load_calib_split(split_json))
+    rng = random.Random(seed)
+    rng.shuffle(ids)
+    n_val = max(1, int(round(len(ids) * val_frac)))
+    val_ids = sorted(ids[:n_val])
+    train_ids = sorted(ids[n_val:])
+    return train_ids, val_ids
 
 
 # ---------------------------------------------------------------------------
@@ -265,18 +290,19 @@ def main():
     out_dir   = REPO / args.out
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Build datasets ──────────────────────────────────────────────────────
-    print("\nBuilding training dataset (test split × all conditions) ...")
-    train_ids = load_split(REPO / args.split_json)
+    # ── Build datasets (leakage-free: TRAIN + VAL both from CALIBRATION) ──────
+    train_ids, val_ids = calib_train_val(REPO / args.split_json, seed=args.seed)
+    print(f"\nCalibration split -> train={len(train_ids)} imgs, val={len(val_ids)} imgs "
+          f"(test split untouched, reported by 24_evaluate_cach.py)")
+    print("Building CACH training dataset (calibration-train × all conditions) ...")
     train_ds = CACHDataset(flir_root, preds_dir, train_ids,
-                            model_name=args.model, patch_size=args.patch_size,
-                            seed=args.seed)
+                            model_name=args.model, split_name="calibration",
+                            patch_size=args.patch_size, seed=args.seed)
 
-    print("\nBuilding validation dataset (calib split × all conditions) ...")
-    val_ids = load_calib_split(REPO / args.split_json)
+    print("Building CACH validation dataset (calibration-val × all conditions) ...")
     val_ds = CACHDataset(flir_root, preds_dir, val_ids,
-                          model_name=args.model, patch_size=args.patch_size,
-                          seed=args.seed + 1)
+                          model_name=args.model, split_name="calibration",
+                          patch_size=args.patch_size, seed=args.seed + 1)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                               num_workers=args.num_workers, collate_fn=collate_fn,
@@ -322,11 +348,11 @@ def main():
         _ece_ok = not (val_ece != val_ece)  # True if val_ece is not nan
         if (_ece_ok and val_ece < best_ece) or (not _ece_ok and train_loss < best_ece):
             best_ece = val_ece if _ece_ok else train_loss
-            model.save(str(out_dir / "cach_best.pt"))
+            model.save(str(out_dir / f"{args.model}_cach_best.pt"))
             _msg = f"val ECE={best_ece:.4f}" if _ece_ok else f"train_loss={best_ece:.4f} (no val data)"
             print(f"    *** New best {_msg}  (checkpoint saved)")
 
-    model.save(str(out_dir / "cach_final.pt"))
+    model.save(str(out_dir / f"{args.model}_cach_final.pt"))
 
     # ── Training log ────────────────────────────────────────────────────────
     log_csv = out_dir / "training_log.csv"
@@ -334,7 +360,7 @@ def main():
         w = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_ece", "val_loss"])
         w.writeheader(); w.writerows(log_rows)
     print(f"\nBest val ECE: {best_ece:.4f}")
-    print(f"Checkpoints: {out_dir}/cach_best.pt, cach_final.pt")
+    print(f"Checkpoints: {out_dir}/{args.model}_cach_best.pt, {args.model}_cach_final.pt")
     print(f"Log:         {log_csv}")
 
 
