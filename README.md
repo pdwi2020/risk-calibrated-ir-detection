@@ -147,13 +147,13 @@ cd risk-calibrated-ir-detection
 pip install -r requirements.txt
 ```
 
-**Requirements summary:** Python 3.10, PyTorch >= 2.1.0, torchvision >= 0.16.0, ultralytics >= 8.0.0 (YOLOv8/v11 + RT-DETR), pycocotools, scikit-learn, scipy, albumentations, opencv-python.
+**Requirements summary:** Python 3.10, PyTorch >= 2.1.0, torchvision >= 0.16.0, ultralytics >= 8.0.0 (YOLOv8/v11 + RT-DETR), pycocotools, scikit-learn, scipy, pandas, albumentations, opencv-python; shap and grad-cam for the explainability stage.
 
 ---
 
 ## Datasets
 
-The datasets are **not included**. Download them from their official sources. Pass the dataset roots with `--flir-root`, `--llvip-root` or `--kaist-root`, or set `FLIR_ROOT` for the `run_p5_*.sh` runners and `regen_dataset_figure.py`. The YOLO descriptors in `configs/*.yaml` contain the authors' local paths; edit their `path:` field before training.
+The datasets are **not included**. Download them from their official sources.
 
 | Dataset | Source | Notes |
 |---|---|---|
@@ -161,58 +161,76 @@ The datasets are **not included**. Download them from their official sources. Pa
 | LLVIP | https://bupt-ai-cz.github.io/LLVIP/ | Low-light visible-IR pairs |
 | KAIST | https://soonminhwang.github.io/rgbt-ped-detection/ | RGB-T pedestrian, used for cross-sensor recalibration |
 
-All headline numbers use the frozen FLIR calibration/test split in `configs/flir_val_calibration_images.txt` and `configs/flir_val_test_images.txt` (572 images each). The split is shared across detectors and seeds, and no image appears in both halves.
+Several scripts expect FLIR ADAS v2 at `datasets/flir_adas_v2/FLIR_ADAS_v2` inside the repository (the folder is git-ignored). Place or symlink it there, or pass `--flir-root` where a script accepts it; the `run_p5_*.sh` runners and `regen_dataset_figure.py` read `FLIR_ROOT` instead. The YOLO descriptors in `configs/*.yaml` contain the authors' local paths; edit their `path:` field before training.
+
+All headline numbers use the frozen FLIR calibration/test split in `configs/flir_val_calibration_images.txt` and `configs/flir_val_test_images.txt` (572 images each), derived from `configs/flir_val_split.json`. The split is shared across detectors and seeds, and no image appears in both halves.
 
 ---
 
 ## Pipeline Usage
 
-The numbered scripts in `scripts/` define a linear pipeline. Run them from the repository root. A GPU (CUDA) is needed wherever detectors are trained or run (Stages 1, 2, 4, 5 and 6); the calibration, risk, conformal and CACH stages run on CPU from cached predictions.
+The numbered scripts in `scripts/` define a linear pipeline. Run them from the repository root; results are written to `results/` (git-ignored). A GPU (CUDA) is needed wherever detectors are trained or run (Stages 1, 2, 4, 5 and 6b); the calibration, risk, conformal and CACH stages run on CPU from cached predictions. Every script with arguments documents them in `--help` and in its module docstring.
 
 ### Stage 0: Dataset audit
 ```bash
-python scripts/00_dataset_audit.py --x9 /path/to/data
+python scripts/00_dataset_audit.py --x9 /path/to/data/root
 ```
 
 ### Stage 1: Detector fine-tuning
 ```bash
 python scripts/01_train_yolo.py --flir-root /path/to/FLIR_ADAS_v2
 python scripts/02_train_frcnn.py --flir-root /path/to/FLIR_ADAS_v2
-python scripts/03_train_retina_rtdetr.py --flir-root /path/to/FLIR_ADAS_v2
+python scripts/03_train_retina_rtdetr.py --model retinanet --flir-root /path/to/FLIR_ADAS_v2
+python scripts/03_train_retina_rtdetr.py --model rtdetr --flir-root /path/to/FLIR_ADAS_v2
 ```
 
-### Stage 2: Detector evaluation
+### Stage 2: Detector evaluation (cached predictions for the calibration and test halves)
 ```bash
-python scripts/04_eval_detector.py --flir-root /path/to/FLIR_ADAS_v2 \
-    --checkpoint results/yolov8m_flir_best.pt
+python scripts/04_eval_detector.py --detector yolov8 --weights /path/to/best.pt \
+    --img-dir /path/to/flir_yolo/val/images --label-dir /path/to/flir_yolo/val/labels \
+    --split-json configs/flir_val_split.json --which calibration \
+    --out results/yolov8m_flir_seed0/eval/yolov8m_calib
+python scripts/04_eval_detector.py --detector yolov8 --weights /path/to/best.pt \
+    --img-dir /path/to/flir_yolo/val/images --label-dir /path/to/flir_yolo/val/labels \
+    --split-json configs/flir_val_split.json --which test \
+    --out results/yolov8m_flir_seed0/eval/yolov8m_test
 python scripts/07_detector_comparison.py
 ```
+Repeat for `--detector rtdetr`, `faster_rcnn` and `retinanet`.
 
-### Stage 3: Cost/risk evaluation
+### Stage 3: Cost/risk evaluation (fit on calibration, report on test)
 ```bash
-python scripts/05_risk_eval.py --split-json configs/flir_val_split.json
+python scripts/05_risk_eval.py \
+    --calib-json results/yolov8m_flir_seed0/eval/yolov8m_calib_predictions.json \
+    --test-json  results/yolov8m_flir_seed0/eval/yolov8m_test_predictions.json \
+    --out        results/yolov8m_flir_seed0/eval/yolov8m_risk_summary.json
 python scripts/08_cost_ablation.py
 python scripts/09_bootstrap_ci.py
 ```
 
 ### Stage 4: Corruption robustness
 ```bash
-python scripts/10_run_corruption_eval.py --flir-root /path/to/FLIR_ADAS_v2
+python scripts/10_run_corruption_eval.py      # needs FLIR under datasets/ and the trained weights in results/
 python scripts/22_corruption_robustness.py
 ```
 
 ### Stage 5: Domain transfer
 ```bash
-python scripts/11_domain_transfer.py
-python scripts/12_train_llvip.py --llvip-root /path/to/llvip
-python scripts/13_tsne_features.py
+python src/data/llvip_splits.py --root /path/to/LLVIP-YOLO      # once
+python scripts/11_domain_transfer.py --direction D1 \
+    --flir-weights /path/to/best.pt --llvip-root /path/to/LLVIP-YOLO
+python scripts/12_train_llvip.py --llvip-root /path/to/LLVIP-YOLO
+python scripts/13_tsne_features.py --flir-weights /path/to/best.pt \
+    --flir-img-dir /path/to/flir_yolo/val/images --flir-lbl-dir /path/to/flir_yolo/val/labels \
+    --llvip-img-dir /path/to/LLVIP-YOLO/test/lwir/images --llvip-lbl-dir /path/to/LLVIP-YOLO/test/lwir/labels
 ```
+`--direction` takes D1 to D4; see the docstring of `11_domain_transfer.py` for the extra arguments of each direction.
 
 ### Stage 6: Post-hoc calibration + CACH data preparation
 ```bash
 python scripts/14_corruption_calibration.py
-python scripts/14a_corruption_infer.py --flir-root /path/to/FLIR_ADAS_v2
-python scripts/15_micro_calibration.py --kaist-root /path/to/kaist
+python scripts/14a_corruption_infer.py --flir-root /path/to/FLIR_ADAS_v2 --llvip-root /path/to/LLVIP-YOLO
+python scripts/15_micro_calibration.py
 ```
 
 ### Stage 7: Risk metric ablations
@@ -224,7 +242,7 @@ python scripts/19_deferral_curve.py
 ```
 
 ### Stage 8: Per-detector CACH (leakage-free protocol used in the paper)
-Needs the corruption prediction caches from Stage 6b in `results/corruption_preds`. Each runner trains one head per detector on the calibration split, copies it to `results/cach/<detector>_cach_best.pt`, and then runs `24_evaluate_cach.py` on the test split.
+Needs the corruption prediction caches from Stage 6 in `results/corruption_preds`. Each runner trains one head per detector on the calibration split, copies it to `results/cach/<detector>_cach_best.pt`, and then runs `24_evaluate_cach.py` on the test split.
 ```bash
 export FLIR_ROOT=/path/to/FLIR_ADAS_v2
 bash scripts/run_p5_local.sh          # unregularised heads (20e)
@@ -235,8 +253,9 @@ python scripts/25_cach_bootstrap_ci.py
 
 ### Stage 9: Explainability
 ```bash
-python scripts/22_xai_gradcam.py
-python scripts/23_xai_shap_cach.py
+python scripts/22_xai_gradcam.py --flir-root /path/to/FLIR_ADAS_v2 --weights /path/to/best.pt
+python scripts/23_xai_shap_cach.py --cach-checkpoint results/cach/yolov8m_cach_best.pt \
+    --flir-root /path/to/FLIR_ADAS_v2 --preds-dir results/corruption_preds
 ```
 
 ### Stage 10: Scene-level conformal control, transfer reference and stability

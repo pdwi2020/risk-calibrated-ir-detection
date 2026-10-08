@@ -1,5 +1,5 @@
 """Driver: run full corruption robustness evaluation for all 4 detectors.
-Run from project root: python /tmp/mv_paper_scripts/10_run_corruption_eval.py
+Run from project root: python scripts/10_run_corruption_eval.py
 
 Requires:
   - GPU (or CPU will be slow) — run on vast.ai box

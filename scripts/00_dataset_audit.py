@@ -264,9 +264,8 @@ def visualise_samples(paths: dict, out_dir: Path) -> None:
     try:
         import sys as _sys
         _sys.path.insert(0, str(paths["src_root"]))
-        from src.corruption.corruption_pipeline import CorruptionPipeline
+        from src.corruption.corruption_pipeline import CORRUPTION_REGISTRY, _FOG_T, _GAUSS_STD
 
-        pipe = CorruptionPipeline()
         demo_img_path = flir_img_dir / Path(sample_imgs[0]["file_name"]).name
         demo_img = np.array(PILImage.open(demo_img_path).convert("L"))  # grayscale
 
@@ -278,17 +277,17 @@ def visualise_samples(paths: dict, out_dir: Path) -> None:
         axes2[0][0].axis("off")
 
         for i, sev in enumerate([1, 2, 3, 4]):
-            corrupted = pipe.apply(demo_img, "gaussian_noise", sev)
+            corrupted = CORRUPTION_REGISTRY["gaussian_noise"](demo_img, sev)
             ax = axes2[(i + 1) // 3][(i + 1) % 3]
             ax.imshow(corrupted, cmap="gray", vmin=0, vmax=255)
-            sigma = pipe.SEVERITY_PARAMS["gaussian_noise"][sev - 1]
+            sigma = _GAUSS_STD[sev]
             ax.set_title(f"Severity {sev} (σ={sigma})", fontsize=10)
             ax.axis("off")
 
         # Show fog corruption severity 4 for comparison
-        fog_corrupted = pipe.apply(demo_img, "fog_koschmieder", 4)
+        fog_corrupted = CORRUPTION_REGISTRY["fog"](demo_img, 4)
         axes2[1][2].imshow(fog_corrupted, cmap="gray", vmin=0, vmax=255)
-        axes2[1][2].set_title("Fog severity 4 (β=1.0)", fontsize=10)
+        axes2[1][2].set_title(f"Fog severity 4 (T={_FOG_T[4]})", fontsize=10)
         axes2[1][2].axis("off")
 
         plt.tight_layout()

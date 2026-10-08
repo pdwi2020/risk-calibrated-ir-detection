@@ -24,8 +24,8 @@ build/
 *.pdf
 
 # Data directories
-data/
-datasets/
+/data/
+/datasets/
 
 # Output / experiment directories
 results/
